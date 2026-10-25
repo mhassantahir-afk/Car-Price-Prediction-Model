@@ -1,6 +1,6 @@
 """
-Laptop Price Prediction - Student Demo App
-------------------------------------------
+Laptop Price Prediction - Student Demo App  (version 2)
+-------------------------------------------------------
 A small Streamlit web app that lets students interact with the trained
 model from the "Laptop Price Prediction" notebook (practice3.ipynb),
 without needing to run Jupyter.
@@ -10,21 +10,32 @@ notebook (a pipeline that already contains the imputer + scaler + one-hot
 encoder + Random Forest), so the app sends raw feature values and the
 pipeline does all the encoding itself.
 
-The drop-down lists are built from laptop_price.csv, using the same
-feature extraction as the notebook, so every choice offered to the user
-is something the model has actually seen.
+HOW THE DROP-DOWN LISTS WORK
+Every list is built from laptop_price.csv and each list only shows values
+that exist together with the choices made ABOVE it. This is what stops
+impossible laptops from being selected:
+    * a MacBook never offers a touchscreen, Windows, or a 17-inch screen
+    * after choosing a screen size, only resolutions that exist for that
+      size are offered (13.3" MacBook Pro -> 2560 x 1600 only)
+    * a list with only one possible value is shown greyed-out ("fixed")
+Two modes are available at the top of the page:
+    * Strict (default): the whole laptop must exist in the dataset.
+    * Flexible: the body (type, screen, OS) is still fixed by the model,
+      but CPU / graphics / RAM / storage can be any value seen for that
+      brand. Useful for "what if" questions, but less reliable.
 
 Files that must be in the SAME folder as this script:
     laptop_app.py
     laptop_price_model_full_dataset.pkl
     laptop_price.csv
+    requirements.txt   (only needed for installing / deploying)
 
 To run:
-    pip install streamlit
+    pip install -r requirements.txt
     streamlit run laptop_app.py
 
-Use the same scikit-learn version that saved the model, otherwise loading
-the .pkl file may fail or give warnings.
+Only load .pkl files you created yourself: unpickling a file from an
+unknown source can run arbitrary code.
 
 NOTE: This is an educational demo. Prices reflect the dataset, not today's
 market.
@@ -32,6 +43,7 @@ market.
 
 import pickle
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +65,10 @@ NUMERICAL_FEATURES = ["Inches", "Touchscreen", "Ram_GB", "Cpu_GHz", "IPS", "Res_
                       "Flash_GB", "Hybrid_GB", "PPI", "SSD_GB", "HDD_GB"]
 CATEGORICAL_FEATURES = ["Company", "Product", "TypeName", "Cpu_family", "Gpu_brand", "OpSys"]
 
+# Columns that must exist in laptop_price.csv
+REQUIRED_COLUMNS = ["Company", "Product", "TypeName", "Inches", "ScreenResolution",
+                    "Cpu", "Ram", "Memory", "Gpu", "OpSys"]
+
 # Friendly names for common resolutions (others are shown as WIDTH x HEIGHT)
 RESOLUTION_NAMES = {
     (1366, 768): "HD",
@@ -62,6 +78,9 @@ RESOLUTION_NAMES = {
     (3200, 1800): "QHD+",
     (3840, 2160): "4K Ultra HD",
 }
+
+STRICT_MODE = "Strict: only laptops that exist in the dataset (recommended)"
+FLEXIBLE_MODE = "Flexible: any CPU / graphics / RAM / storage seen for this brand"
 
 # ---------------------------------------------------------------------------
 # Load the trained model and the data used for the drop-down lists
@@ -74,9 +93,16 @@ for required_file in (MODEL_PATH, DATA_PATH):
 
 
 @st.cache_resource
-def load_model():
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+def load_model(file_mtime):
+    """Loads the pickle. Returns (model, list of warning messages) or (None, [error])."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            with open(MODEL_PATH, "rb") as f:
+                model = pickle.load(f)
+        except Exception as error:      # wrong scikit-learn version, corrupt file, ...
+            return None, [f"{type(error).__name__}: {error}"]
+    return model, [str(w.message) for w in caught]
 
 
 def parse_storage(s):
@@ -98,15 +124,20 @@ def cpu_family(s):
 
 
 @st.cache_data
-def load_catalogue():
-    """Reads the CSV and extracts the same features as the notebook."""
+def load_catalogue(file_mtime):
+    """Reads the CSV and extracts the same features as the notebook.
+    Returns (catalogue, number of rows that had to be skipped)."""
     df = pd.read_csv(DATA_PATH, encoding="latin-1")
 
-    df["Ram_GB"] = df["Ram"].str.replace("GB", "").astype(int)
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        return None, missing
+
+    df["Ram_GB"] = pd.to_numeric(df["Ram"].str.extract(r"(\d+)")[0], errors="coerce")
     df = pd.concat([df, df["Memory"].apply(parse_storage)], axis=1)
 
     res = df["ScreenResolution"].str.extract(r"(\d+)x(\d+)").astype(float)
-    df["Res_W"], df["Res_H"] = res[0].astype(int), res[1].astype(int)
+    df["Res_W"], df["Res_H"] = res[0], res[1]
     df["Touchscreen"] = df["ScreenResolution"].str.contains("Touchscreen").astype(int)
     df["IPS"] = df["ScreenResolution"].str.contains("IPS").astype(int)
 
@@ -114,20 +145,43 @@ def load_catalogue():
     df["Cpu_brand"] = df["Cpu"].str.split().str[0]      # only used to narrow the CPU list
     df["Cpu_family"] = df["Cpu"].apply(cpu_family)
     df["Gpu_brand"] = df["Gpu"].str.split().str[0]
-    return df
+
+    # Rows where a number could not be read would put NaN into the drop-downs
+    usable = df[["Ram_GB", "Res_W", "Res_H", "Cpu_GHz", "Inches"]].notna().all(axis=1)
+    skipped = int((~usable).sum())
+    df = df[usable].copy()
+
+    df["Ram_GB"] = df["Ram_GB"].astype(int)
+    df["Res_W"], df["Res_H"] = df["Res_W"].astype(int), df["Res_H"].astype(int)
+    df["Resolution"] = df["Res_W"].astype(str) + "x" + df["Res_H"].astype(str)   # one value per resolution
+    return df.reset_index(drop=True), skipped
 
 
-model = load_model()
-catalogue = load_catalogue()
+model, model_messages = load_model(MODEL_PATH.stat().st_mtime)
+if model is None:
+    st.error(
+        "The model file could not be loaded. This usually means the scikit-learn version here "
+        "is different from the one that saved the model.\n\n"
+        f"`{model_messages[0]}`\n\nInstall the same version (see requirements.txt) or re-run the "
+        "notebook to save the model again."
+    )
+    st.stop()
+
+catalogue, skipped_rows = load_catalogue(DATA_PATH.stat().st_mtime)
+if catalogue is None:
+    st.error(f"`laptop_price.csv` is missing these columns: {', '.join(skipped_rows)}")
+    st.stop()
+
+# Make sure the model expects exactly the columns this app sends
+expected_columns = getattr(model, "feature_names_in_", None)
+if expected_columns is not None and set(expected_columns) != set(NUMERICAL_FEATURES + CATEGORICAL_FEATURES):
+    st.error("The model was trained on different features than this app sends. "
+             f"Model expects: {list(expected_columns)}")
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-
-def pick(options, preferred):
-    """Index of `preferred` in `options`; 0 if it is not there."""
-    return options.index(preferred) if preferred in options else 0
 
 
 def storage_label(gb):
@@ -135,20 +189,63 @@ def storage_label(gb):
     if gb == 0:
         return "None"
     if gb >= 1024:
-        tb = gb / 1024
-        return f"{tb:g} TB"
+        return f"{gb / 1024:g} TB"
     return f"{gb:g} GB"
 
 
-def resolution_label(res):
-    width, height = res
+def resolution_label(key):
+    width, height = (int(v) for v in key.split("x"))
     name = RESOLUTION_NAMES.get((width, height))
     return f"{width} x {height}" + (f"  ({name})" if name else "")
 
 
-def storage_options(column):
-    """Sizes seen in the data for this storage type; 'None' (0) is always first."""
-    return sorted(set(catalogue[column].tolist()) | {0.0})
+def resolution_size(key):
+    width, height = (int(v) for v in key.split("x"))
+    return width * height
+
+
+def choose(label, column, rows, path, *, format_func=str, sort_key=None,
+           default_rows=None, append_to_path=True):
+    """
+    Draws one drop-down whose options are ONLY the values of `column` that exist in `rows`.
+
+    rows           the laptops that are still possible given the choices made so far
+    path           list of the choices made so far; it is part of the widget key, so when an
+                   earlier choice changes, this drop-down is rebuilt with a fresh default
+    default_rows   if given, the starting value is the most common value in these rows
+    append_to_path add this choice to `path` (so later drop-downs depend on it)
+
+    Returns (selected value, rows narrowed to that value).
+    A drop-down with a single possible value is shown greyed out.
+    """
+    options = sorted(rows[column].unique().tolist(), key=sort_key)
+
+    source = default_rows if default_rows is not None and len(default_rows) else rows
+    counts = source[column].value_counts()
+    counts = counts.sort_index().sort_values(ascending=False, kind="stable")
+    preferred = next((v for v in counts.index if v in options), options[0])
+
+    only_one = len(options) == 1
+    value = st.selectbox(
+        label.format(n=len(options)),
+        options,
+        index=options.index(preferred),
+        format_func=format_func,
+        key="|".join(path + [column]),
+        disabled=only_one,
+        help="Only one option exists for this selection in the dataset." if only_one else None,
+    )
+    if append_to_path:
+        path.append(str(value))
+    return value, rows[rows[column] == value]
+
+
+def stretch_button(label):
+    """Full-width primary button; works on old and new Streamlit versions."""
+    try:
+        return st.button(label, type="primary", width="stretch")
+    except TypeError:                      # older Streamlit has no `width` argument
+        return st.button(label, type="primary", use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -159,118 +256,108 @@ st.title("💻 Laptop Price Predictor")
 st.markdown(
     """
     This is a teaching demo built from the **Laptop Price Prediction** notebook.
-    Choose a laptop's specifications below and the trained model will estimate its
-    price in euros. Picking a model fills in its usual specifications, which you can
-    then change.
+    Choose a laptop's specifications and the trained model will estimate its price in euros.
+
+    Each list only offers choices that exist for the options above it, so impossible
+    laptops (for example a touchscreen MacBook) cannot be selected. A greyed-out list
+    has only one possible value.
     """
 )
+
+if skipped_rows:
+    st.warning(f"{skipped_rows} row(s) in laptop_price.csv could not be read and were left out of the lists.")
+for message in model_messages:
+    st.warning(f"While loading the model: {message}")
+
+mode = st.radio("Choices offered", [STRICT_MODE, FLEXIBLE_MODE], key="mode")
+STRICT = mode == STRICT_MODE
+if not STRICT:
+    st.caption("Flexible mode can create laptops that do not exist in the dataset, "
+               "so the estimate is less reliable.")
 st.divider()
+
+path = []   # the choices made so far (part of every widget key)
 
 # ---- 1. Brand and model ---------------------------------------------------
 st.subheader("1. Brand and model")
 col1, col2 = st.columns(2)
 
 with col1:
-    companies = sorted(catalogue["Company"].unique().tolist())
-    company = st.selectbox("Laptop Company", companies)
-
-company_rows = catalogue[catalogue["Company"] == company]
-
+    company, company_rows = choose("Laptop Company", "Company", catalogue, path)
 with col2:
-    products = sorted(company_rows["Product"].unique().tolist())
-    product = st.selectbox(f"Model ({len(products)} available)", products, key=f"product|{company}")
+    product, rows = choose("Model ({n} available)", "Product", company_rows, path)
 
-# The usual configuration of the chosen model, used as the starting values below
-typical = catalogue[(catalogue["Company"] == company) & (catalogue["Product"] == product)].mode().iloc[0]
-
-with col1:
-    types = sorted(catalogue["TypeName"].unique().tolist())
-    type_name = st.selectbox("Laptop Type", types, index=pick(types, typical["TypeName"]),
-                             key=f"type|{product}")
-
-with col2:
-    op_systems = sorted(catalogue["OpSys"].unique().tolist())
-    op_sys = st.selectbox("Operating System", op_systems, index=pick(op_systems, typical["OpSys"]),
-                          key=f"os|{product}")
-
-# ---- 2. Processor and graphics -------------------------------------------
-st.subheader("2. Processor and graphics")
+# ---- 2. Body and screen ---------------------------------------------------
+# These are fixed by the model, so they are narrowed in BOTH modes.
+st.subheader("2. Type and screen")
 col1, col2 = st.columns(2)
 
 with col1:
-    cpu_brands = sorted(catalogue["Cpu_brand"].unique().tolist())
-    cpu_brand = st.selectbox("CPU Company", cpu_brands, index=pick(cpu_brands, typical["Cpu_brand"]),
-                             key=f"cpu_brand|{product}")
-
-brand_rows = catalogue[catalogue["Cpu_brand"] == cpu_brand]
-
+    type_name, rows = choose("Laptop Type", "TypeName", rows, path)
 with col2:
-    cpu_families = sorted(brand_rows["Cpu_family"].unique().tolist())
-    cpu_fam = st.selectbox("CPU Family", cpu_families, index=pick(cpu_families, typical["Cpu_family"]),
-                           key=f"cpu_family|{product}|{cpu_brand}")
-
+    inches, rows = choose("Screen Size", "Inches", rows, path, format_func=lambda v: f'{v:g}"')
 with col1:
-    speeds = sorted(brand_rows[brand_rows["Cpu_family"] == cpu_fam]["Cpu_GHz"].unique().tolist())
-    cpu_ghz = st.selectbox("CPU Speed (GHz)", speeds, index=pick(speeds, float(typical["Cpu_GHz"])),
-                           key=f"cpu_ghz|{product}|{cpu_brand}|{cpu_fam}")
-
+    resolution, rows = choose("Resolution", "Resolution", rows, path,
+                              format_func=resolution_label, sort_key=resolution_size)
 with col2:
-    gpu_brands = sorted(catalogue["Gpu_brand"].unique().tolist())
-    gpu_brand = st.selectbox("Graphics Card Company", gpu_brands,
-                             index=pick(gpu_brands, typical["Gpu_brand"]), key=f"gpu|{product}")
+    ips, rows = choose("Screen Type", "IPS", rows, path,
+                       format_func=lambda v: "IPS panel" if v == 1 else "Standard panel")
+with col1:
+    touch, rows = choose("Touchscreen", "Touchscreen", rows, path,
+                         format_func=lambda v: "Yes" if v == 1 else "No")
+with col2:
+    op_sys, rows = choose("Operating System", "OpSys", rows, path)
 
-# ---- 3. Memory and storage -----------------------------------------------
-st.subheader("3. Memory and storage")
+body_rows = rows                 # every laptop that matches the model and its screen/body
+body_path = list(path)
+
+# In strict mode the lists keep narrowing. In flexible mode they use the whole brand instead.
+defaults = None if STRICT else body_rows
+
+
+def next_rows(narrowed):
+    return narrowed if STRICT else company_rows
+
+
+# ---- 3. Processor and graphics -------------------------------------------
+st.subheader("3. Processor and graphics")
 col1, col2 = st.columns(2)
 
 with col1:
-    ram_options = sorted(catalogue["Ram_GB"].unique().tolist())
-    ram = st.selectbox("RAM", ram_options, index=pick(ram_options, int(typical["Ram_GB"])),
-                       format_func=lambda v: f"{v} GB", key=f"ram|{product}")
+    cpu_brand, rows = choose("CPU Company", "Cpu_brand", next_rows(rows), path, default_rows=defaults)
+with col2:
+    cpu_fam, rows = choose("CPU Family", "Cpu_family", rows, path, default_rows=defaults)
+with col1:
+    cpu_ghz, rows = choose("CPU Speed (GHz)", "Cpu_GHz", rows, path,
+                           format_func=lambda v: f"{v:g}", default_rows=defaults)
 
-    ssd_options = storage_options("SSD_GB")
-    ssd = st.selectbox("SSD Storage", ssd_options, index=pick(ssd_options, float(typical["SSD_GB"])),
-                       format_func=storage_label, key=f"ssd|{product}")
-
-    flash_options = storage_options("Flash_GB")
-    flash = st.selectbox("Flash Storage", flash_options, index=pick(flash_options, float(typical["Flash_GB"])),
-                         format_func=storage_label, key=f"flash|{product}")
+# In flexible mode the remaining lists are independent of each other (and of the CPU),
+# so their keys use `body_path` and they are not added to the path.
+cfg_path = path if STRICT else body_path
 
 with col2:
-    hdd_options = storage_options("HDD_GB")
-    hdd = st.selectbox("Hard Disk (HDD) Storage", hdd_options, index=pick(hdd_options, float(typical["HDD_GB"])),
-                       format_func=storage_label, key=f"hdd|{product}")
+    gpu_brand, rows = choose("Graphics Card Company", "Gpu_brand", next_rows(rows), cfg_path,
+                             default_rows=defaults, append_to_path=STRICT)
 
-    hybrid_options = storage_options("Hybrid_GB")
-    hybrid = st.selectbox("Hybrid (SSHD) Storage", hybrid_options,
-                          index=pick(hybrid_options, float(typical["Hybrid_GB"])),
-                          format_func=storage_label, key=f"hybrid|{product}")
-
-# ---- 4. Screen -----------------------------------------------------------
-st.subheader("4. Screen")
+# ---- 4. Memory and storage -----------------------------------------------
+st.subheader("4. Memory and storage")
 col1, col2 = st.columns(2)
 
 with col1:
-    size_options = sorted(catalogue["Inches"].unique().tolist())
-    inches = st.selectbox("Screen Size", size_options, index=pick(size_options, float(typical["Inches"])),
-                          format_func=lambda v: f'{v:g}"', key=f"inches|{product}")
-
-    panel_options = ["Standard panel", "IPS panel"]
-    panel = st.selectbox("Screen Type", panel_options, index=int(typical["IPS"]), key=f"panel|{product}")
-
+    ram, rows = choose("RAM", "Ram_GB", next_rows(rows), cfg_path, format_func=lambda v: f"{v} GB",
+                       default_rows=defaults, append_to_path=STRICT)
 with col2:
-    resolutions = sorted(
-        {(int(w), int(h)) for w, h in zip(catalogue["Res_W"], catalogue["Res_H"])},
-        key=lambda r: r[0] * r[1],
-    )
-    resolution = st.selectbox(
-        "Resolution", resolutions,
-        index=pick(resolutions, (int(typical["Res_W"]), int(typical["Res_H"]))),
-        format_func=resolution_label, key=f"res|{product}",
-    )
-
-    touch = st.radio("Touchscreen", ["No", "Yes"], index=int(typical["Touchscreen"]),
-                     horizontal=True, key=f"touch|{product}")
+    ssd, rows = choose("SSD Storage", "SSD_GB", next_rows(rows), cfg_path, format_func=storage_label,
+                       default_rows=defaults, append_to_path=STRICT)
+with col1:
+    hdd, rows = choose("Hard Disk (HDD) Storage", "HDD_GB", next_rows(rows), cfg_path,
+                       format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
+with col2:
+    flash, rows = choose("Flash Storage", "Flash_GB", next_rows(rows), cfg_path,
+                         format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
+with col1:
+    hybrid, rows = choose("Hybrid (SSHD) Storage", "Hybrid_GB", next_rows(rows), cfg_path,
+                          format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
 
 st.divider()
 
@@ -278,15 +365,15 @@ st.divider()
 # Prediction
 # ---------------------------------------------------------------------------
 
-if st.button("Predict Price", type="primary", use_container_width=True):
-    res_w, res_h = resolution
+if stretch_button("Predict Price"):
+    res_w, res_h = (int(v) for v in resolution.split("x"))
 
     user_input = pd.DataFrame({
         "Inches": [float(inches)],
-        "Touchscreen": [1 if touch == "Yes" else 0],
+        "Touchscreen": [int(touch)],
         "Ram_GB": [int(ram)],
         "Cpu_GHz": [float(cpu_ghz)],
-        "IPS": [1 if panel == "IPS panel" else 0],
+        "IPS": [int(ips)],
         "Res_W": [float(res_w)],
         "Res_H": [float(res_h)],
         "Flash_GB": [float(flash)],
@@ -304,9 +391,20 @@ if st.button("Predict Price", type="primary", use_container_width=True):
 
     predicted_price = float(model.predict(user_input)[0])
 
+    # How many laptops in the dataset have exactly this configuration?
+    same = pd.Series(True, index=catalogue.index)
+    for column in NUMERICAL_FEATURES + CATEGORICAL_FEATURES:
+        if column != "PPI":
+            same &= catalogue[column] == user_input.at[0, column]
+    n_same = int(same.sum())
+
     st.success(f"### Estimated Price: €{predicted_price:,.0f}")
     if TYPICAL_ERROR_EUROS is not None:
         st.caption(f"Typical error of this model (cross-validation RMSE): about €{TYPICAL_ERROR_EUROS:,.0f}")
+    if n_same:
+        st.caption(f"This exact configuration appears {n_same} time(s) in the dataset the model learned from.")
+    else:
+        st.warning("This exact configuration is not in the dataset, so the estimate is less reliable.")
 
     with st.expander("See the feature vector sent to the model"):
         st.dataframe(user_input.T.rename(columns={0: "Value"}).astype(str))
