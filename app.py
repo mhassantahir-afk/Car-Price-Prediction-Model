@@ -1,5 +1,5 @@
 """
-Laptop Price Prediction - Student Demo App  (version 2)
+Laptop Price Prediction - Student Demo App  (version 3)
 -------------------------------------------------------
 A small Streamlit web app that lets students interact with the trained
 model from the "Laptop Price Prediction" notebook (practice3.ipynb),
@@ -11,18 +11,22 @@ encoder + Random Forest), so the app sends raw feature values and the
 pipeline does all the encoding itself.
 
 HOW THE DROP-DOWN LISTS WORK
-Every list is built from laptop_price.csv and each list only shows values
-that exist together with the choices made ABOVE it. This is what stops
-impossible laptops from being selected:
-    * a MacBook never offers a touchscreen, Windows, or a 17-inch screen
-    * after choosing a screen size, only resolutions that exist for that
-      size are offered (13.3" MacBook Pro -> 2560 x 1600 only)
-    * a list with only one possible value is shown greyed-out ("fixed")
-Two modes are available at the top of the page:
-    * Strict (default): the whole laptop must exist in the dataset.
-    * Flexible: the body (type, screen, OS) is still fixed by the model,
-      but CPU / graphics / RAM / storage can be any value seen for that
-      brand. Useful for "what if" questions, but less reliable.
+The lists are built from laptop_price.csv. To stop impossible laptops from
+being selected without being too restrictive, the choices are limited in
+three levels:
+
+  1. Fixed by the MODEL      laptop type, screen size, resolution
+                             (a 13.3" MacBook Pro only offers 2560 x 1600,
+                              and its screen size can only be 13.3" or 15.4")
+  2. Limited by the BRAND    touchscreen, screen type, operating system,
+                             CPU company / family / speed, graphics company
+                             (no touchscreen or Windows on a MacBook)
+  3. Limited by the TYPE     RAM and every storage type
+                             (any amount seen in laptops of the same type,
+                              from any brand)
+
+A list with only one possible value is shown greyed-out. Starting values are
+the usual configuration of the chosen model, and every list can be changed.
 
 Files that must be in the SAME folder as this script:
     laptop_app.py
@@ -78,9 +82,6 @@ RESOLUTION_NAMES = {
     (3200, 1800): "QHD+",
     (3840, 2160): "4K Ultra HD",
 }
-
-STRICT_MODE = "Strict: only laptops that exist in the dataset (recommended)"
-FLEXIBLE_MODE = "Flexible: any CPU / graphics / RAM / storage seen for this brand"
 
 # ---------------------------------------------------------------------------
 # Load the trained model and the data used for the drop-down lists
@@ -258,9 +259,10 @@ st.markdown(
     This is a teaching demo built from the **Laptop Price Prediction** notebook.
     Choose a laptop's specifications and the trained model will estimate its price in euros.
 
-    Each list only offers choices that exist for the options above it, so impossible
-    laptops (for example a touchscreen MacBook) cannot be selected. A greyed-out list
-    has only one possible value.
+    Picking a model fills in its usual specifications, which you can then change. The lists
+    avoid impossible laptops: the screen is tied to the model (size and resolution go together),
+    and things like touchscreen, operating system and processor are limited to what the brand
+    actually makes. A greyed-out list has only one possible value.
     """
 )
 
@@ -268,12 +270,6 @@ if skipped_rows:
     st.warning(f"{skipped_rows} row(s) in laptop_price.csv could not be read and were left out of the lists.")
 for message in model_messages:
     st.warning(f"While loading the model: {message}")
-
-mode = st.radio("Choices offered", [STRICT_MODE, FLEXIBLE_MODE], key="mode")
-STRICT = mode == STRICT_MODE
-if not STRICT:
-    st.caption("Flexible mode can create laptops that do not exist in the dataset, "
-               "so the estimate is less reliable.")
 st.divider()
 
 path = []   # the choices made so far (part of every widget key)
@@ -285,13 +281,13 @@ col1, col2 = st.columns(2)
 with col1:
     company, company_rows = choose("Laptop Company", "Company", catalogue, path)
 with col2:
-    product, rows = choose("Model ({n} available)", "Product", company_rows, path)
+    product, model_rows = choose("Model ({n} available)", "Product", company_rows, path)
 
-# ---- 2. Body and screen ---------------------------------------------------
-# These are fixed by the model, so they are narrowed in BOTH modes.
+# ---- 2. Type and screen: fixed by the model ------------------------------
 st.subheader("2. Type and screen")
 col1, col2 = st.columns(2)
 
+rows = model_rows
 with col1:
     type_name, rows = choose("Laptop Type", "TypeName", rows, path)
 with col2:
@@ -299,65 +295,63 @@ with col2:
 with col1:
     resolution, rows = choose("Resolution", "Resolution", rows, path,
                               format_func=resolution_label, sort_key=resolution_size)
-with col2:
-    ips, rows = choose("Screen Type", "IPS", rows, path,
-                       format_func=lambda v: "IPS panel" if v == 1 else "Standard panel")
-with col1:
-    touch, rows = choose("Touchscreen", "Touchscreen", rows, path,
-                         format_func=lambda v: "Yes" if v == 1 else "No")
-with col2:
-    op_sys, rows = choose("Operating System", "OpSys", rows, path)
 
-body_rows = rows                 # every laptop that matches the model and its screen/body
-body_path = list(path)
+typical_rows = rows            # this model with this screen: used for the starting values below
+body_path = list(path)         # the lists below restart only when the model or its screen changes
 
-# In strict mode the lists keep narrowing. In flexible mode they use the whole brand instead.
-defaults = None if STRICT else body_rows
-
-
-def next_rows(narrowed):
-    return narrowed if STRICT else company_rows
-
-
-# ---- 3. Processor and graphics -------------------------------------------
-st.subheader("3. Processor and graphics")
+# ---- 3. Screen features, OS, processor and graphics: limited by the brand -
+# These lists are independent of each other, so changing one does not reset the others
+# (except the CPU lists, which depend on each other: company -> family -> speed).
+st.subheader("3. Features, processor and graphics")
 col1, col2 = st.columns(2)
 
 with col1:
-    cpu_brand, rows = choose("CPU Company", "Cpu_brand", next_rows(rows), path, default_rows=defaults)
+    touch, _ = choose("Touchscreen", "Touchscreen", company_rows, body_path,
+                      format_func=lambda v: "Yes" if v == 1 else "No",
+                      default_rows=typical_rows, append_to_path=False)
 with col2:
-    cpu_fam, rows = choose("CPU Family", "Cpu_family", rows, path, default_rows=defaults)
+    ips, _ = choose("Screen Type", "IPS", company_rows, body_path,
+                    format_func=lambda v: "IPS panel" if v == 1 else "Standard panel",
+                    default_rows=typical_rows, append_to_path=False)
 with col1:
-    cpu_ghz, rows = choose("CPU Speed (GHz)", "Cpu_GHz", rows, path,
-                           format_func=lambda v: f"{v:g}", default_rows=defaults)
-
-# In flexible mode the remaining lists are independent of each other (and of the CPU),
-# so their keys use `body_path` and they are not added to the path.
-cfg_path = path if STRICT else body_path
-
+    op_sys, _ = choose("Operating System", "OpSys", company_rows, body_path,
+                       default_rows=typical_rows, append_to_path=False)
 with col2:
-    gpu_brand, rows = choose("Graphics Card Company", "Gpu_brand", next_rows(rows), cfg_path,
-                             default_rows=defaults, append_to_path=STRICT)
+    gpu_brand, _ = choose("Graphics Card Company", "Gpu_brand", company_rows, body_path,
+                          default_rows=typical_rows, append_to_path=False)
 
-# ---- 4. Memory and storage -----------------------------------------------
+cpu_path = list(body_path)
+with col1:
+    cpu_brand, cpu_rows = choose("CPU Company", "Cpu_brand", company_rows, cpu_path,
+                                 default_rows=typical_rows)
+with col2:
+    cpu_fam, cpu_rows = choose("CPU Family", "Cpu_family", cpu_rows, cpu_path,
+                               default_rows=typical_rows)
+with col1:
+    cpu_ghz, _ = choose("CPU Speed (GHz)", "Cpu_GHz", cpu_rows, cpu_path,
+                        format_func=lambda v: f"{v:g}", default_rows=typical_rows)
+
+# ---- 4. Memory and storage: limited by the laptop type -------------------
+# Any amount seen in laptops of the same type (from any brand), so there is plenty to choose from.
 st.subheader("4. Memory and storage")
+type_rows = catalogue[catalogue["TypeName"] == type_name]
 col1, col2 = st.columns(2)
 
 with col1:
-    ram, rows = choose("RAM", "Ram_GB", next_rows(rows), cfg_path, format_func=lambda v: f"{v} GB",
-                       default_rows=defaults, append_to_path=STRICT)
+    ram, _ = choose("RAM", "Ram_GB", type_rows, body_path, format_func=lambda v: f"{v} GB",
+                    default_rows=typical_rows, append_to_path=False)
 with col2:
-    ssd, rows = choose("SSD Storage", "SSD_GB", next_rows(rows), cfg_path, format_func=storage_label,
-                       default_rows=defaults, append_to_path=STRICT)
+    ssd, _ = choose("SSD Storage", "SSD_GB", type_rows, body_path, format_func=storage_label,
+                    default_rows=typical_rows, append_to_path=False)
 with col1:
-    hdd, rows = choose("Hard Disk (HDD) Storage", "HDD_GB", next_rows(rows), cfg_path,
-                       format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
+    hdd, _ = choose("Hard Disk (HDD) Storage", "HDD_GB", type_rows, body_path,
+                    format_func=storage_label, default_rows=typical_rows, append_to_path=False)
 with col2:
-    flash, rows = choose("Flash Storage", "Flash_GB", next_rows(rows), cfg_path,
-                         format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
+    flash, _ = choose("Flash Storage", "Flash_GB", type_rows, body_path,
+                      format_func=storage_label, default_rows=typical_rows, append_to_path=False)
 with col1:
-    hybrid, rows = choose("Hybrid (SSHD) Storage", "Hybrid_GB", next_rows(rows), cfg_path,
-                          format_func=storage_label, default_rows=defaults, append_to_path=STRICT)
+    hybrid, _ = choose("Hybrid (SSHD) Storage", "Hybrid_GB", type_rows, body_path,
+                       format_func=storage_label, default_rows=typical_rows, append_to_path=False)
 
 st.divider()
 
@@ -404,7 +398,7 @@ if stretch_button("Predict Price"):
     if n_same:
         st.caption(f"This exact configuration appears {n_same} time(s) in the dataset the model learned from.")
     else:
-        st.warning("This exact configuration is not in the dataset, so the estimate is less reliable.")
+        st.caption("This exact configuration is not in the dataset, so treat the estimate as approximate.")
 
     with st.expander("See the feature vector sent to the model"):
         st.dataframe(user_input.T.rename(columns={0: "Value"}).astype(str))
