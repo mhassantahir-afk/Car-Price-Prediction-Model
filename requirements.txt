@@ -1,0 +1,15 @@
+# Libraries needed by laptop_app.py
+# (pickle is part of Python, so it is not listed)
+#
+# scikit-learn is needed even though the app never imports it directly:
+# the saved .pkl file contains scikit-learn objects, and loading it requires
+# the same scikit-learn version that was used to save it.
+# To pin the exact versions from your notebook's environment, run
+#   pip freeze
+# in that environment and copy the lines for these four packages,
+# e.g.  scikit-learn==1.7.2
+
+streamlit
+pandas
+numpy
+scikit-learn
